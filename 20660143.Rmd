@@ -1,0 +1,183 @@
+---
+title: "Music recommendation"
+output: html_document
+---
+
+```{r}
+library(data.table) 
+library(MASS)
+library(ridge)
+library(ranger)
+library(xgboost)
+library(survival)
+library(gbm)
+```
+
+```{r}
+setwd("C:/Users/Think/Desktop")
+train <- fread("train.csv")
+test <- fread("test.csv")
+members <- fread("members.csv")
+songs <- fread("songs.csv")
+
+#train&test
+train[, id := 1:nrow(train)]
+test[, target := -1]
+info <- rbind(train, test)
+
+#member
+standard_time <- function(i){
+  dd<-as.character(i)
+  paste0(substr(dd, 1, 4), "-", substr(dd, 5, 6), "-", substr(dd, 7, 8))
+}
+members[, registration_year := as.integer(substr(standard_time(registration_init_time), 1, 4))]
+members[, registration_month := as.integer(substr(standard_time(registration_init_time), 6,7))]
+members[, expiration_year := as.integer(substr(standard_time(expiration_date), 1, 4))]
+members[, expiration_month := as.integer(substr(standard_time(expiration_date), 6,7))]
+members[, registration_init_time := as.Date(standard_time(registration_init_time))]
+members[, expiration_date := as.Date(standard_time(expiration_date))]
+
+#songs
+uni <- with(songs, union(artist_name, union(composer, lyricist)))
+songs[, ":=" (artist_name= match(artist_name, uni), composer = match(composer, uni), lyricist = match(lyricist, uni))]
+songs[, singer_writer := as.integer(1+
+            ifelse( composer == "" | artist_name == composer, 1, 0 )+
+            ifelse( lyricist == "" | artist_name == lyricist, 1, 0 ))]
+uni<- songs[, .(nrArtistSongs = .N), by= artist_name]
+songs<- merge(songs, uni, by= "artist_name", all.x=TRUE)
+songs[ is.na(songs$language), language := -1]
+songs[, language := as.integer(language)]
+
+#mix the four
+info <- merge(info, members, by = "msno", all.x=TRUE)
+info <- merge(info, songs, by = "song_id", all.x=TRUE)
+
+for (f in names(info)){
+  if( class(info[[f]]) == "character"){
+    info[is.na(info[[f]]), eval(f) := ""]
+    info[, eval(f) := as.integer(
+      as.factor(info[[f]]))]
+  } else info[is.na(info[[f]]), eval(f) := -1]
+}
+info[, registration_init_time := julian(registration_init_time)]
+info[, expiration_date := julian(expiration_date)]
+info[, length_membership := 
+       expiration_date - registration_init_time]
+
+# clean data deal with NULL
+setDF(info)
+train_cl <- info[info$target != -1,]
+test_cl <- info[info$target == -1,]
+train_id <- train_cl$id
+train_cl$id <- NULL
+tg <- train_cl$target
+train_cl$target <- NULL
+test_cl$target <- NULL
+test_id <- test_cl$id
+test_cl$id <- NULL
+rm(info); rm(songs); rm(members)
+rm(train); rm(test); rm(uni); gc()
+train_cl <- train_cl[order(train_id), ]
+tg <- tg[order(train_id)]
+test_cl <- test_cl[order(test_id), ]
+```
+
+```{r}
+set.seed(100)
+s<- sample(nrow(train_cl), 0.2*nrow(train_cl))
+ense <- train_cl[s, ]
+tg_ense <- tg[s]
+train_cl <- train_cl[-s, ]
+tg <- tg[-s]
+
+# scale the columns after split
+deal <- names(train_cl)
+for (i in deal){
+  mu <- mean(train_cl[[i]])
+  sigma <- sd(train_cl[[i]])
+  train_cl[[i]] <- (train_cl[[i]] -mu)/sigma
+  test_cl[[i]] <- (test_cl[[i]] -mu)/sigma
+  ense[[i]] <- (ense[[i]] -mu)/sigma
+}
+# shrink train set
+shrk <- sample(nrow(train_cl), 0.01 *nrow(train_cl))
+y <- tg[shrk]
+tr <- train_cl[shrk,]
+```
+
+```{r}
+#log loss
+logl <- function(actual, probs){
+  probs <- ifelse(probs >0, probs, 10^-10)
+  return ( - mean(actual* log(probs)))
+}
+# accuracy
+accu <- function(actual, probs, theta=0.5){
+  probs <- ifelse(probs > theta, 1, 0)
+  return(mean(probs == actual))
+}
+# mean absolute error
+mae <- function(actuals, prediction) mean(abs(actuals-prediction))
+# mean squared root error
+rmse <- function(actuals, prediction) sqrt(mean((actuals-prediction)^2))
+
+diagnosis <- function(actual, probs, title=""){
+  cat("\nSummary results for", title
+      , "\nlogl:", logl(actual, probs)
+      , "\naccu:", accu(actual, probs)
+      , "\nmae:", mae(actual, probs)
+      , "\nrmse:", rmse(actual, probs)
+      , "\n"
+      )
+}
+```
+
+```{r}
+# logistic regression
+glm <- glm(y ~ . , data = tr, family=binomial(link="logit"))
+pred_glm_e<-predict(glm, ense, type = "response")
+pred_glm_t<-predict(glm, test_cl, type = "response")
+diagnosis(tg_ense, pred_glm_e, title="logistic regression")
+```
+
+```{r}
+# random forest
+rf <- ranger(y ~ . , data = tr, num.trees = 10, verbose= FALSE)
+pred_rf_e<-predict(rf, ense, type = "response")
+pred_rf_e <- pred_rf_e$predictions
+pred_rf_t<-predict(rf, test_cl, type = "response")
+pred_rf_t <- pred_rf_t$predictions
+diagnosis(tg_ense, pred_rf_e, title="random forest")
+
+rf2 <- ranger(y ~ . , data = tr, num.trees = 100, verbose= FALSE)
+pred_rf2_e<-predict(rf2, ense, type = "response")
+pred_rf2_e <- pred_rf2_e$predictions
+pred_rf2_t<-predict(rf2, test_cl, type = "response")
+pred_rf2_t <- pred_rf2_t$predictions
+diagnosis(tg_ense, pred_rf2_e, title="random forest")
+```
+
+```{r}
+gbm.m <- gbm(formula = y ~ .,distribution = "bernoulli",data = tr,n.trees = 1000,interaction.depth = 7,shrinkage = 0.01,cv.folds = 3)
+iter <- gbm.perf(gbm.m,method = "cv")
+
+pred_g_e<-predict(gbm.m, ense, type = "response")
+pred_g_t<-predict(gbm.m, test_cl, type = "response")
+diagnosis(tg_ense, pred_g_e, title="gradient boosting")
+```
+
+```{r}
+# xgboost
+param <- list(max_depth=2, eta=1, silent=1, objective='binary:logistic')
+x_train <- xgb.DMatrix(as.matrix(tr), label = y, missing=-1)
+x_val <- xgb.DMatrix(as.matrix(ense),label = tg_ense, missing=-1)
+x_test <- xgb.DMatrix(as.matrix(test_cl), missing= -1)
+xgbt <- xgb.train(data = x_train, params = param, nrounds = 100) 
+
+pred_3_e  <- predict(xgbt, x_val)
+pred_3_t  <- predict(xgbt, x_test) 
+diagnosis(tg_ense, pred_3_e, title="xgb")
+```
+
+
+
